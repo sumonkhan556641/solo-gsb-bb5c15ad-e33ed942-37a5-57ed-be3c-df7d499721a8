@@ -266,6 +266,15 @@ button.primary:hover:not(:disabled) { background: var(--accent-dark); }
 /* 补印面板 */
 .reprint-card h2 { margin: 0 0 6px; font-size: 16px; }
 .reprint-card .hint { margin: 0 0 10px; }
+.reprint-sub {
+  margin: 16px 0 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  font-size: 14px;
+}
+#reprintRunInfo { font-size: 13px; }
+#reprintRunInfo p { margin: 0 0 8px; }
+#reprintRunInfo .muted { color: var(--muted); }
 .reprint-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .reprint-controls input {
   flex: 1;

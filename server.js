@@ -13,6 +13,8 @@ const {
   buildProofHtml,
   planReprint,
   buildReprintProofHtml,
+  planReprintRun,
+  buildReprintRunCsv,
 } = require('./src/imposition');
 
 const app = express();
@@ -148,6 +150,38 @@ app.post('/api/reprint/proof', (req, res) => {
     : `reprint-proof-${st.totalPages}p.html`;
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.send(result.html);
+});
+
+/** 补印生产单：按「页码:份数」核算每张实体纸张的实际补印份数（同纸多页取各页需求最大值）与实体纸张总用量 */
+app.post('/api/reprint/run', (req, res) => {
+  const body = req.body || {};
+  const plan = planReprintRun(body.state, body.items);
+  if (!plan) {
+    return res.status(400).json({ error: '拼版数据格式不正确' });
+  }
+  if (plan.error) {
+    return res.status(400).json({ error: plan.error, errors: plan.errors });
+  }
+  res.json(plan);
+});
+
+/** 补印生产单 CSV：内容与屏幕生产单一致；输入无效或拼版有错时拒绝下载 */
+app.post('/api/reprint/run/csv', (req, res) => {
+  const body = req.body || {};
+  const result = buildReprintRunCsv(body.state, body.items);
+  if (!result) {
+    return res.status(400).json({ error: '拼版数据格式不正确' });
+  }
+  if (result.error) {
+    return res.status(400).json({ error: result.error, errors: result.errors });
+  }
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  const st = body.state || {};
+  const filename = Array.isArray(st.signatures)
+    ? `reprint-run-${st.totalPages}p-${st.signatureCount}sig.csv`
+    : `reprint-run-${st.totalPages}p.csv`;
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(result.csv);
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
