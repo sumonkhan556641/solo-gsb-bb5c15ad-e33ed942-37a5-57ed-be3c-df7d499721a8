@@ -29,6 +29,11 @@ const els = {
   reprintProofBtn: document.getElementById('reprintProofBtn'),
   reprintInfo: document.getElementById('reprintInfo'),
   reprintList: document.getElementById('reprintList'),
+  productionInput: document.getElementById('productionInput'),
+  productionPlanBtn: document.getElementById('productionPlanBtn'),
+  productionCsvBtn: document.getElementById('productionCsvBtn'),
+  productionInfo: document.getElementById('productionInfo'),
+  productionList: document.getElementById('productionList'),
   summary: document.getElementById('summary'),
   sheets: document.getElementById('sheets'),
   errors: document.getElementById('errors'),
@@ -52,6 +57,7 @@ let selected = null; // 交换模式下已选中的版位 { sig, sheet, side, po
 let validateTimer = null;
 let repairPlan = null; // 当前修复方案 { steps, fingerprint, baseJson, stale }
 let reprintData = null; // 最近一次成功的补印清单（用于控制补印打样下载按钮）
+let productionData = null; // 最近一次成功的补印生产单（用于控制生产单 CSV 下载按钮）
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -117,6 +123,7 @@ function setLayout(next) {
     els.proofBtn.disabled = true;
     els.errors.innerHTML = '<p class="muted">已切换拼版模式，请重新点击「生成拼版」。</p>';
     refreshReprint();
+    refreshProduction();
   }
 }
 
@@ -407,6 +414,7 @@ function updateModeUI() {
 
 function scheduleValidate() {
   clearTimeout(validateTimer);
+  invalidateProduction(); // 拼版已变化：旧生产单立即失效（随后按当前拼版自动重算）
   validateTimer = setTimeout(validateNow, 200);
 }
 
@@ -428,6 +436,7 @@ async function validateNow() {
     els.proofBtn.disabled = true;
   }
   refreshReprint();
+  refreshProduction();
 }
 
 function renderErrors(result) {
@@ -622,6 +631,7 @@ async function applyRepairPlan() {
     selected = null;
     discardRepairPlan();
     render();
+    invalidateProduction(); // 拼版已被修复改动：旧生产单立即失效
     validateNow();
   } catch (e) {
     if (e.status === 409 && repairPlan) {
@@ -736,6 +746,130 @@ async function downloadReprintProof() {
   URL.revokeObjectURL(url);
 }
 
+/* ---------- 补印生产单（按页份数核算） ---------- */
+
+/** 生成生产单：服务端基于已校验的当前拼版按「页码:份数」核算，同纸命中多页时实印份数取需求最大值 */
+async function generateProductionPlan() {
+  if (!state) {
+    productionData = null;
+    els.productionCsvBtn.disabled = true;
+    renderProductionMessage('muted', '请先生成拼版。');
+    return;
+  }
+  try {
+    const data = await api('/api/reprint/production/plan', { state, items: els.productionInput.value });
+    productionData = data;
+    renderProductionPlan(data);
+  } catch (e) {
+    productionData = null;
+    renderProductionMessage('reprint-err', e.message);
+  }
+  els.productionCsvBtn.disabled = !productionData || productionData.sheetCount === 0;
+}
+
+function renderProductionMessage(cls, text) {
+  els.productionInfo.innerHTML = '';
+  els.productionList.innerHTML = '';
+  const p = document.createElement('p');
+  p.className = cls;
+  p.textContent = text;
+  els.productionInfo.appendChild(p);
+}
+
+/** 渲染生产单：汇总实体纸张总用量；每张命中纸列出实印份数、每页需求与随印超出份数及正反四个版位 */
+function renderProductionPlan(data) {
+  els.productionInfo.innerHTML = '';
+  const p = document.createElement('p');
+  p.className = 'reprint-ok';
+  p.textContent =
+    `需返工 ${data.items.length} 页，涉及 ${data.sheetCount} 张纸；` +
+    `实体纸张总用量 ${data.totalCopies} 份（随印超出合计 ${data.totalExtra} 份）：`;
+  els.productionInfo.appendChild(p);
+
+  els.productionList.innerHTML = '';
+  for (const s of data.sheets) {
+    const li = document.createElement('li');
+    li.className = 'reprint-sheet';
+
+    const head = document.createElement('div');
+    head.className = 'reprint-sheet-head';
+    const where = document.createElement('strong');
+    where.textContent = s.sig == null ? `第 ${s.sheet} 张纸` : `第 ${s.sig} 帖 · 第 ${s.sheet} 张纸`;
+    const copies = document.createElement('span');
+    copies.className = 'reprint-hit';
+    copies.textContent = `实印 ${s.copies} 份`;
+    head.append(where, copies);
+
+    const hits = document.createElement('div');
+    hits.className = 'reprint-slots';
+    for (const h of s.hits) {
+      const row = document.createElement('span');
+      row.textContent = `第 ${h.page} 页：需求 ${h.copies} 份 · 随印超出 ${h.extra} 份`;
+      hits.appendChild(row);
+    }
+
+    const slots = document.createElement('div');
+    slots.className = 'reprint-slots';
+    for (const side of ['front', 'back']) {
+      const row = document.createElement('span');
+      row.textContent =
+        `${SIDE_LABEL[side]}：左版 ${valueLabel(s[side].left)} · 右版 ${valueLabel(s[side].right)}`;
+      slots.appendChild(row);
+    }
+    li.append(head, hits, slots);
+    els.productionList.appendChild(li);
+  }
+}
+
+/** 拼版或输入变化后，旧生产单立即失效：清空结果并禁用 CSV 下载 */
+function invalidateProduction() {
+  productionData = null;
+  els.productionCsvBtn.disabled = true;
+  els.productionList.innerHTML = '';
+  els.productionInfo.innerHTML = els.productionInput.value.trim()
+    ? '<p class="muted">拼版已变化，正在按当前拼版重算生产单…</p>'
+    : '';
+}
+
+/** 拼版变化后同步生产单面板：份数输入非空时自动重算生产单，否则清空并禁用下载 */
+function refreshProduction() {
+  if (!state || els.productionInput.value.trim() === '') {
+    productionData = null;
+    els.productionCsvBtn.disabled = true;
+    els.productionList.innerHTML = '';
+    els.productionInfo.innerHTML = state ? '' : '<p class="muted">请先生成拼版。</p>';
+    return;
+  }
+  generateProductionPlan();
+}
+
+/** 下载生产单 CSV：与屏幕结果一致（服务端按当前拼版与输入重新校验，有错即拒绝） */
+async function downloadProductionCsv() {
+  if (!state || !productionData) return;
+  const res = await fetch('/api/reprint/production/csv', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ state, items: els.productionInput.value }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    alert(data.error || '生产单 CSV 下载失败');
+    generateProductionPlan(); // 拼版可能已变化：刷新生产单与下载按钮状态
+    return;
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = layout === 'multi'
+    ? `reprint-production-${state.totalPages}p-${state.signatureCount}sig.csv`
+    : `reprint-production-${state.totalPages}p.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 /* ---------- 导出 ---------- */
 
 /** 下载结果文件（CSV / 打样 HTML）的通用逻辑 */
@@ -797,6 +931,20 @@ els.reprintInput.addEventListener('input', () => {
   els.reprintList.innerHTML = '';
   els.reprintInfo.innerHTML = els.reprintInput.value.trim()
     ? '<p class="muted">页码已修改，请点击「生成补印清单」。</p>'
+    : '';
+});
+els.productionPlanBtn.addEventListener('click', generateProductionPlan);
+els.productionCsvBtn.addEventListener('click', downloadProductionCsv);
+els.productionInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') generateProductionPlan();
+});
+els.productionInput.addEventListener('input', () => {
+  // 份数输入已修改：旧生产单失效，需重新生成后才能下载
+  productionData = null;
+  els.productionCsvBtn.disabled = true;
+  els.productionList.innerHTML = '';
+  els.productionInfo.innerHTML = els.productionInput.value.trim()
+    ? '<p class="muted">输入已修改，请点击「生成生产单」。</p>'
     : '';
 });
 els.pagesInput.addEventListener('keydown', (e) => {

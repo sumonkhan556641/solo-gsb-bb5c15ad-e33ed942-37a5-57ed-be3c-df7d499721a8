@@ -29,6 +29,12 @@ const crypto = require('crypto');
  * 帖号及帖内纸张序排列，同张纸命中多页只列一次，清单含命中页与该纸正反四个
  * 版位；可下载仅含清单纸张的双面补印打样（正反面成对，沿用短边翻转镜像、
  * 空白版位与爬移补偿参数）。
+ *
+ * 补印生产单（按页份数核算）：输入「页码:份数」的逗号分隔项（如 2:5,7:3），
+ * 页码不可重复、份数须为正整数；基于已校验的当前拼版反查每页所在实体纸张，
+ * 同一纸张命中多个返工页时，该纸实印份数取各页需求的最大值，并逐页列出需求
+ * 份数与随印超出份数；生产单按帖号、帖内纸张序排列并汇总实体纸张总用量，
+ * 可下载与屏幕结果一致的 CSV。
  */
 
 const SIDES = ['front', 'back'];
@@ -1007,6 +1013,161 @@ function buildReprintProofHtml(raw, input) {
   return { html, plan };
 }
 
+/* ---------- 补印生产单（按页份数核算） ---------- */
+
+/**
+ * 解析按页份数输入：逗号分隔的「页码:份数」项（如 2:5,7:3，兼容全角冒号与全角逗号）。
+ * 页码须为 1~maxPage 的整数（成品页码，不含补齐的空白页位）且不可重复；份数须为正整数。
+ * 返回 { items: [{ page, copies }] }（按页码升序）；输入非法返回 { error }（说明具体原因）。
+ */
+function parseReprintQuantities(input, maxPage) {
+  const text = String(input ?? '').trim();
+  if (!text) {
+    return { error: '请输入需返工的页码与份数（逗号分隔的「页码:份数」，如 2:5,7:3）' };
+  }
+  // 全角逗号/顿号/分号 → 半角逗号；全角冒号 → 半角冒号；忽略空白字符
+  const normalized = text
+    .replace(/[，、；;]/g, ',')
+    .replace(/：/g, ':')
+    .replace(/\s+/g, '');
+  const copiesByPage = new Map();
+  for (const token of normalized.split(',')) {
+    if (token === '') {
+      return { error: '列表中存在空项（多余的分隔符），请检查输入' };
+    }
+    const item = token.match(/^([^:]+):([^:]+)$/);
+    if (!item) {
+      return { error: `无法识别的项「${token}」，请用「页码:份数」格式（如 2:5），多项以逗号分隔` };
+    }
+    if (!/^\d+$/.test(item[1])) {
+      return { error: `无法识别的页码「${item[1]}」，页码须为 1~${maxPage} 的整数` };
+    }
+    const page = Number(item[1]);
+    if (page < 1 || page > maxPage) {
+      return { error: `第 ${page} 页超出成品页范围 1~${maxPage}` };
+    }
+    if (!/^\d+$/.test(item[2]) || !Number.isSafeInteger(Number(item[2])) || Number(item[2]) < 1) {
+      return { error: `第 ${page} 页的份数须为正整数` };
+    }
+    if (copiesByPage.has(page)) {
+      return { error: `第 ${page} 页重复出现，同一页码只能指定一次份数` };
+    }
+    copiesByPage.set(page, Number(item[2]));
+  }
+  const items = [...copiesByPage.entries()]
+    .map(([page, copies]) => ({ page, copies }))
+    .sort((a, b) => a.page - b.page);
+  return { items };
+}
+
+/**
+ * 生成补印生产单（按页份数核算）：基于已校验的当前拼版，反查每个返工页所在实体纸张。
+ * 同一纸张命中多个返工页时，该纸实印份数取各页需求的最大值；每页列出需求份数与
+ * 随印超出份数（= 纸张实印份数 − 该页需求）。清单按帖号与帖内纸张序排列。
+ * 要求当前拼版通过校验（存在错误时返回 { error, errors }，说明原因）；
+ * 输入非法时返回 { error }；拼版结构非法返回 null。
+ * 成功返回 { items, sheetCount, totalCopies, totalExtra, sheets }：
+ *  - items        解析后的 [{ page, copies }]（按页码升序）；
+ *  - sheets       每项含纸张实印份数 copies、命中页明细 hits（[{ page, copies, extra }]）
+ *                 与该纸正反四个版位（front/back 的 left/right）；
+ *  - sheetCount   命中纸张数；
+ *  - totalCopies  实体纸张总用量（各纸实印份数之和）；
+ *  - totalExtra   随印超出总份数（各页超出份数之和）。
+ */
+function planReprintProduction(raw, input) {
+  const state = normalizeState(raw);
+  if (!state) return null;
+  const validation = validateImposition(raw);
+  if (!validation.valid) {
+    return {
+      error: `当前拼版存在错误（${summarizeErrors(validation.errors)}），请先修复或重置后再核算生产单`,
+      errors: validation.errors,
+    };
+  }
+  const parsed = parseReprintQuantities(input, state.pages);
+  if (parsed.error) return { error: parsed.error };
+
+  const demand = new Map(parsed.items.map((it) => [it.page, it.copies]));
+  const groups = state.mode === 'multi'
+    ? state.signatures
+    : [{ sig: null, sheets: state.sheets }];
+  const sheets = [];
+  let totalCopies = 0;
+  let totalExtra = 0;
+  for (const g of groups) {
+    for (const s of g.sheets) {
+      const hits = [];
+      for (const side of SIDES) {
+        for (const pos of POSITIONS) {
+          const v = s[side][pos];
+          if (v !== null && demand.has(v)) hits.push({ page: v, copies: demand.get(v) });
+        }
+      }
+      if (hits.length === 0) continue;
+      hits.sort((a, b) => a.page - b.page);
+      const copies = Math.max(...hits.map((h) => h.copies)); // 同纸多页：实印份数取需求最大值
+      for (const h of hits) {
+        h.extra = copies - h.copies; // 随印超出份数
+        totalExtra += h.extra;
+      }
+      totalCopies += copies;
+      const entry = {
+        sheet: s.index,
+        copies,
+        hits,
+        front: { left: s.front.left, right: s.front.right },
+        back: { left: s.back.left, right: s.back.right },
+      };
+      if (s.sig != null) entry.sig = s.sig;
+      if (state.creep) entry.creep = s.creep;
+      sheets.push(entry);
+    }
+  }
+  return {
+    items: parsed.items,
+    sheetCount: sheets.length,
+    totalCopies,
+    totalExtra,
+    sheets,
+  };
+}
+
+/**
+ * 生成生产单 CSV（带 BOM，Excel 友好），内容与屏幕生产单一致：
+ * 每个命中页一行（纸张实印份数、页需求份数、随印超出份数），末行为合计
+ * （实体纸张总用量 = 各纸实印份数之和；随印超出合计 = 各页超出份数之和）。
+ * 返回 { csv, plan }；输入非法或拼版未通过校验返回 { error, errors? }；结构非法返回 null。
+ */
+function buildReprintProductionCsv(raw, input) {
+  const state = normalizeState(raw);
+  if (!state) return null;
+  const plan = planReprintProduction(raw, input);
+  if (plan.error) return plan;
+
+  const multi = state.mode === 'multi';
+  const rows = [
+    multi
+      ? ['帖号', '帖内纸张序号', '实际补印份数', '返工页码', '页需求份数', '随印超出份数']
+      : ['纸张序号', '实际补印份数', '返工页码', '页需求份数', '随印超出份数'],
+  ];
+  for (const s of plan.sheets) {
+    for (const h of s.hits) {
+      rows.push(
+        multi
+          ? [String(s.sig), String(s.sheet), String(s.copies), String(h.page), String(h.copies), String(h.extra)]
+          : [String(s.sheet), String(s.copies), String(h.page), String(h.copies), String(h.extra)]
+      );
+    }
+  }
+  // 合计行：实体纸张总用量与随印超出合计（与屏幕汇总一致）
+  rows.push(
+    multi
+      ? ['合计', '', String(plan.totalCopies), '', '', String(plan.totalExtra)]
+      : ['合计', String(plan.totalCopies), '', '', String(plan.totalExtra)]
+  );
+  return { csv: '﻿' + rows.map((r) => r.join(',')).join('\r\n') + '\r\n', plan };
+}
+
 /** 生成 CSV（带 BOM，Excel 友好）；结构非法返回 null */
 function buildCsv(raw) {
   const state = normalizeState(raw);
@@ -1082,4 +1243,7 @@ module.exports = {
   parseReprintPages,
   planReprint,
   buildReprintProofHtml,
+  parseReprintQuantities,
+  planReprintProduction,
+  buildReprintProductionCsv,
 };
